@@ -1,4 +1,4 @@
--- MY CHIIKAWA RESTAURANT - AUTO FISHING HUB V6.1
+-- MY CHIIKAWA RESTAURANT - AUTO FISHING HUB V7 (OPTIMIZED)
 -- F1 = show/hide hub; X = hide hub; END = stop fishing
 -- Config includes independent Anti-AFK toggle and test button.
 -- Hub stays loaded when hidden.
@@ -31,6 +31,7 @@ local hookAttempts = 0
 local lastTap = 0
 local lastMinigame = 0
 local lastCastPoint = nil
+local textAddedConnection, textRemovingConnection
 
 -- Hub layout
 local gui = Instance.new("ScreenGui")
@@ -189,7 +190,10 @@ settingsTab.MouseButton1Click:Connect(function() selectTab("Config") end)
 selectTab("Fishing")
 
 local function setStatus(message)
-    status.Text = "Status: " .. message
+    local newText = "Status: " .. message
+    if status.Text ~= newText then
+        status.Text = newText
+    end
 end
 
 local function updateToggle()
@@ -320,6 +324,8 @@ gui.Destroying:Connect(function()
     antiAfkEnabled = false
     if inputConnection then inputConnection:Disconnect() end
     if idleConnection then idleConnection:Disconnect() end
+    if textAddedConnection then textAddedConnection:Disconnect() end
+    if textRemovingConnection then textRemovingConnection:Disconnect() end
 end)
 
 -- Character and detection
@@ -339,21 +345,69 @@ local function visible(obj)
     return true
 end
 
-local function findText(phrases)
-    for _, obj in ipairs(playerGui:GetDescendants()) do
-        if (obj:IsA("TextLabel") or obj:IsA("TextButton"))
-            and not obj:IsDescendantOf(gui)
-            and visible(obj)
-            and obj.AbsoluteSize.X > 2 then
-            local content = string.lower(obj.Text)
-            for _, phrase in ipairs(phrases) do
-                if content:find(phrase, 1, true) then
-                    return obj, content
-                end
+-- Cache fishing-related text objects instead of rescanning all PlayerGui descendants
+-- five times per fishing tick. New UI labels are tracked as they are created.
+local textCandidates = {}
+
+local function trackText(obj)
+    if (obj:IsA("TextLabel") or obj:IsA("TextButton"))
+        and not obj:IsDescendantOf(gui) then
+        textCandidates[obj] = true
+    end
+end
+
+for _, obj in ipairs(playerGui:GetDescendants()) do
+    trackText(obj)
+end
+
+textAddedConnection = playerGui.DescendantAdded:Connect(trackText)
+textRemovingConnection = playerGui.DescendantRemoving:Connect(function(obj)
+    textCandidates[obj] = nil
+end)
+
+local function readFishingUI()
+    local result = {}
+
+    for obj in pairs(textCandidates) do
+        if obj.Parent and visible(obj) and obj.AbsoluteSize.X > 2 then
+            local content = obj.Text:lower()
+
+            if not result.mini
+                and (content:find("tap fast", 1, true)
+                    or content:find("/14", 1, true)) then
+                result.mini = obj
+                result.miniText = content
+            end
+
+            if not result.bite
+                and (content:find("a bite!", 1, true)
+                    or content:find("a fish! tap", 1, true)
+                    or content:find("fish! tap", 1, true)) then
+                result.bite = obj
+            end
+
+            if not result.waiting
+                and (content:find("wait for a bite", 1, true)
+                    or content:find("nibble", 1, true)
+                    or content:find("not yet", 1, true)) then
+                result.waiting = obj
+            end
+
+            if not result.ready
+                and (content:find("tap the water to fish", 1, true)
+                    or content:find("tap water to fish", 1, true)) then
+                result.ready = obj
+            end
+
+            if not result.gone
+                and (content:find("it got away", 1, true)
+                    or content:find("got away", 1, true)) then
+                result.gone = obj
             end
         end
     end
-    return nil, nil
+
+    return result
 end
 
 local function mouseClick(x, y)
@@ -393,8 +447,12 @@ end
 local function terrainPond(pos)
     local terrain = Workspace.Terrain
     local best, dist = nil, math.huge
-    for x = -200, 200, 16 do
-        for z = -200, 200, 16 do
+    local sampleCount = 0
+    for x = -200, 200, 24 do
+        for z = -200, 200, 24 do
+            if not enabled or not gui.Parent then return nil, math.huge end
+            sampleCount = sampleCount + 1
+            if sampleCount % 24 == 0 then task.wait() end
             local sample = pos + Vector3.new(x, 0, z)
             local region = Region3.new(sample - Vector3.new(2, 24, 2), sample + Vector3.new(2, 12, 2)):ExpandToGrid(4)
             local ok, materials, occupancy = pcall(function()
@@ -428,9 +486,10 @@ local function terrainPond(pos)
 end
 
 local function nearestPond(pos)
-    local a, da = partPond(pos)
-    local b, db = terrainPond(pos)
-    return (da < db) and a or b
+    local a = partPond(pos)
+    -- Most ponds are named Parts; skip costly terrain sampling when found.
+    if a then return a end
+    return terrainPond(pos)
 end
 
 -- Walking
@@ -469,11 +528,10 @@ end
 -- finish 14 taps, recast ONLY when prompt says ready.
 local function fishStep(targetPond)
     local now = os.clock()
-    local mini, miniText = findText({"tap fast", "/14"})
-    local bite = findText({"a bite!", "a fish! tap", "fish! tap"})
-    local waiting = findText({"wait for a bite", "nibble", "not yet"})
-    local ready = findText({"tap the water to fish", "tap water to fish"})
-    local gone = findText({"it got away", "got away"})
+    local ui = readFishingUI()
+    local mini, miniText = ui.mini, ui.miniText
+    local bite, waiting, ready, gone =
+        ui.bite, ui.waiting, ui.ready, ui.gone
 
     if mini then
         phase = "MINIGAME"
@@ -556,7 +614,11 @@ end
 -- Main loop continues even when the hub is hidden.
 task.spawn(function()
     while gui.Parent do
-        task.wait(0.09)
+        -- Less work while waiting; quick checks during the timed minigame.
+        task.wait(phase == "MINIGAME" and 0.06
+            or phase == "WAITING" and 0.15
+            or enabled and 0.10
+            or 0.30)
         if antiAfkEnabled and pendingAfk and not enabled then
             task.spawn(antiAfkAction)
         end
@@ -592,4 +654,4 @@ task.spawn(function()
     end
 end)
 
-print("Chiikawa Auto Fishing HUB V6 loaded. F1 toggles hub; Config has Anti-AFK.")
+print("Chiikawa Auto Fishing HUB V7 optimized. F1 toggles hub; Config has Anti-AFK.")
